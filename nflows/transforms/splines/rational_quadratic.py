@@ -4,7 +4,6 @@ from torch.nn import functional as F
 
 from ...transforms.base import InputOutsideDomain
 from ...utils import torchutils
-from .utils import apply_spline_at_mask
 
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
@@ -23,43 +22,51 @@ def unconstrained_rational_quadratic_spline(
     min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
     min_derivative=DEFAULT_MIN_DERIVATIVE,
 ):
-    inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
-    outside_interval_mask = ~inside_interval_mask
+    """Rational-quadratic spline with linear tails outside [-tail_bound, tail_bound].
 
-    outputs = torch.zeros_like(inputs)
-    logabsdet = torch.zeros_like(inputs)
-
-    if tails == "linear":
-        unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
-        constant = np.log(np.exp(1 - min_derivative) - 1)
-        unnormalized_derivatives[..., 0] = constant
-        unnormalized_derivatives[..., -1] = constant
-
-        outputs[outside_interval_mask] = inputs[outside_interval_mask]
-        logabsdet[outside_interval_mask] = 0
-    else:
+    Implemented with static shapes: the spline is evaluated on the whole tensor
+    (inputs clamped into the domain) and the tails are selected with
+    ``torch.where``. Compared to masked indexing (``outputs[mask] = ...``) this
+    involves no data-dependent shapes and no host synchronisation, so the
+    function can be captured by ``torch.compile`` without graph breaks and its
+    many small kernels can be fused. The result is numerically identical to the
+    masked formulation.
+    """
+    if tails != "linear":
         raise RuntimeError("{} tails are not implemented.".format(tails))
 
-    if torch.any(inside_interval_mask):
-        outputs, logabsdet = apply_spline_at_mask(
-            rational_quadratic_spline,
-            inputs=inputs,
-            outputs=outputs,
-            logabsdet=logabsdet,
-            mask=inside_interval_mask,
-            unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
-            unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
-            unnormalized_derivatives=unnormalized_derivatives[inside_interval_mask, :],
-            inverse=inverse,
-            left=-tail_bound,
-            right=tail_bound,
-            bottom=-tail_bound,
-            top=tail_bound,
-            min_bin_width=min_bin_width,
-            min_bin_height=min_bin_height,
-            min_derivative=min_derivative,
+    inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
 
-        )
+    unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
+    constant = np.log(np.exp(1 - min_derivative) - 1)
+    unnormalized_derivatives[..., 0] = constant
+    unnormalized_derivatives[..., -1] = constant
+
+    # Clamping keeps every input inside the spline domain, so the (host-syncing)
+    # domain check of the inner spline is redundant here.
+    spline_outputs, spline_logabsdet = rational_quadratic_spline(
+        inputs=inputs.clamp(-tail_bound, tail_bound),
+        unnormalized_widths=unnormalized_widths,
+        unnormalized_heights=unnormalized_heights,
+        unnormalized_derivatives=unnormalized_derivatives,
+        inverse=inverse,
+        left=-tail_bound,
+        right=tail_bound,
+        bottom=-tail_bound,
+        top=tail_bound,
+        min_bin_width=min_bin_width,
+        min_bin_height=min_bin_height,
+        min_derivative=min_derivative,
+        check_domain=False,
+    )
+    outputs = torch.where(
+        inside_interval_mask, spline_outputs.to(inputs.dtype), inputs
+    )
+    logabsdet = torch.where(
+        inside_interval_mask,
+        spline_logabsdet.to(inputs.dtype),
+        torch.zeros_like(inputs),
+    )
     return outputs, logabsdet
 
 
@@ -76,8 +83,17 @@ def rational_quadratic_spline(
     min_bin_width=DEFAULT_MIN_BIN_WIDTH,
     min_bin_height=DEFAULT_MIN_BIN_HEIGHT,
     min_derivative=DEFAULT_MIN_DERIVATIVE,
+    check_domain=True,
 ):
-    if torch.min(inputs) < left or torch.max(inputs) > right:
+    """Rational-quadratic spline on [left, right] x [bottom, top].
+
+    ``check_domain=False`` skips the host-synchronising checks that the inputs
+    lie in the domain (and, for the inverse, that the discriminant is
+    non-negative). Only use it when the caller guarantees the domain, e.g. after
+    clamping; it lets the function be captured by ``torch.compile`` without a
+    graph break.
+    """
+    if check_domain and (torch.min(inputs) < left or torch.max(inputs) > right):
         raise InputOutsideDomain()
 
     num_bins = unnormalized_widths.shape[-1]
@@ -134,7 +150,8 @@ def rational_quadratic_spline(
         c = -input_delta * (inputs - input_cumheights)
 
         discriminant = b.pow(2) - 4 * a * c
-        assert (discriminant >= 0).all()
+        if check_domain:
+            assert (discriminant >= 0).all()
 
         root = (2 * c) / (-b - torch.sqrt(discriminant))
         # root = (- b + torch.sqrt(discriminant)) / (2 * a)
