@@ -42,10 +42,17 @@ def unconstrained_rational_quadratic_spline(
     unnormalized_derivatives[..., 0] = constant
     unnormalized_derivatives[..., -1] = constant
 
-    # Clamping keeps every input inside the spline domain, so the (host-syncing)
-    # domain check of the inner spline is redundant here.
+    # Inputs in the tails are clamped into the spline domain so the spline is
+    # finite everywhere (their spline value is discarded below); inputs inside
+    # the domain, bounds included, pass through unchanged so that their gradient
+    # is exactly that of the masked formulation (the subgradient of clamp at its
+    # bounds differs between torch versions). With every input inside the
+    # domain, the (host-syncing) domain check of the inner spline is redundant.
+    spline_inputs = torch.where(
+        inside_interval_mask, inputs, inputs.clamp(-tail_bound, tail_bound)
+    )
     spline_outputs, spline_logabsdet = rational_quadratic_spline(
-        inputs=inputs.clamp(-tail_bound, tail_bound),
+        inputs=spline_inputs,
         unnormalized_widths=unnormalized_widths,
         unnormalized_heights=unnormalized_heights,
         unnormalized_derivatives=unnormalized_derivatives,
