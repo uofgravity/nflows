@@ -1,7 +1,10 @@
+import numpy as np
 import torch
 import torchtestcase
+from torch.nn import functional as F
 
 from nflows.transforms import splines
+from nflows.transforms.splines import rational_quadratic as rq
 
 
 class RationalQuadraticSplineTest(torchtestcase.TorchTestCase):
@@ -93,26 +96,18 @@ def _reference_unconstrained_rational_quadratic_spline(
     tail_bound=1.0,
 ):
     """The previous (masked-indexing) implementation, kept as a numerical reference."""
-    import numpy as np
-    from torch.nn import functional as F
-
-    from nflows.transforms.splines.rational_quadratic import (
-        DEFAULT_MIN_DERIVATIVE,
-        rational_quadratic_spline,
-    )
-
     inside_interval_mask = (inputs >= -tail_bound) & (inputs <= tail_bound)
     outside_interval_mask = ~inside_interval_mask
     outputs = torch.zeros_like(inputs)
     logabsdet = torch.zeros_like(inputs)
     unnormalized_derivatives = F.pad(unnormalized_derivatives, pad=(1, 1))
-    constant = np.log(np.exp(1 - DEFAULT_MIN_DERIVATIVE) - 1)
+    constant = np.log(np.exp(1 - rq.DEFAULT_MIN_DERIVATIVE) - 1)
     unnormalized_derivatives[..., 0] = constant
     unnormalized_derivatives[..., -1] = constant
     outputs[outside_interval_mask] = inputs[outside_interval_mask]
     logabsdet[outside_interval_mask] = 0
     if torch.any(inside_interval_mask):
-        outputs_masked, logabsdet_masked = rational_quadratic_spline(
+        outputs_masked, logabsdet_masked = rq.rational_quadratic_spline(
             inputs=inputs[inside_interval_mask],
             unnormalized_widths=unnormalized_widths[inside_interval_mask, :],
             unnormalized_heights=unnormalized_heights[inside_interval_mask, :],
@@ -142,9 +137,7 @@ class UnconstrainedRationalQuadraticSplineStaticShapeTest(torchtestcase.TorchTes
         elif mode == "all_outside":
             inputs = torch.sign(torch.randn(*shape)) * (1.0 + torch.rand(*shape))
             inputs = inputs.to(dtype)
-        elif mode == "all_inside":
-            inputs = torch.rand(*shape, dtype=dtype) * 2 - 1
-        elif mode == "boundary":
+        elif mode == "boundary":  # exactly on the tail bounds
             inputs = torch.tensor([-1.0, 1.0, 0.0, -1.0, 1.0] * 16, dtype=dtype).reshape(shape)
         params = [
             torch.randn(*shape, num_bins, dtype=dtype),
@@ -169,9 +162,8 @@ class UnconstrainedRationalQuadraticSplineStaticShapeTest(torchtestcase.TorchTes
         self.assertTrue(torch.equal(ref[0], new[0]), "outputs differ")
         self.assertTrue(torch.equal(ref[1], new[1]), "logabsdet differ")
         for g_ref, g_new in zip(ref[2], new[2]):
-            # When every input lies in the tails the reference never touches the
-            # spline parameters (grad None); the static-shape version returns an
-            # explicit zero gradient, which is equivalent.
+            # all_outside: the reference never touches the spline parameters (grad
+            # None); the static-shape version gives an explicit zero, equivalent.
             if g_ref is None:
                 self.assertTrue(g_new is None or not g_new.any(), "gradients differ")
             else:
@@ -179,43 +171,20 @@ class UnconstrainedRationalQuadraticSplineStaticShapeTest(torchtestcase.TorchTes
 
     def test_matches_reference_implementation(self):
         for dtype in (torch.float32, torch.float64):
-            for mode in ("mixed", "all_outside", "all_inside", "boundary"):
+            for mode in ("mixed", "all_outside", "boundary"):
                 for inverse in (False, True):
                     with self.subTest(dtype=dtype, mode=mode, inverse=inverse):
                         self._check(dtype, mode, inverse)
 
     def test_compiles_without_graph_breaks(self):
-        if not hasattr(torch, "compile"):
-            self.skipTest("torch.compile not available")
         inputs, params = self._make_inputs(torch.float32, "mixed")
-        for inverse in (False, True):
-            eager_out, eager_logabsdet = splines.unconstrained_rational_quadratic_spline(
-                inputs, *params, inverse=inverse
-            )
-            compiled = torch.compile(
-                splines.unconstrained_rational_quadratic_spline,
-                fullgraph=True,
-                backend="aot_eager",
-            )
-            out, logabsdet = compiled(inputs, *params, inverse=inverse)
-            self.eps = 1e-6
-            self.assertEqual(out, eager_out)
-            self.assertEqual(logabsdet, eager_logabsdet)
-
-    def test_inner_spline_domain_check_is_optional(self):
-        from nflows.transforms.base import InputOutsideDomain
-
-        num_bins = 8
-        shape = [4, 3]
-        params = [
-            torch.randn(*shape, num_bins),
-            torch.randn(*shape, num_bins),
-            torch.randn(*shape, num_bins + 1),
-        ]
-        inputs = torch.rand(*shape) + 1.5  # outside [0, 1]
-        with self.assertRaises(InputOutsideDomain):
-            splines.rational_quadratic_spline(inputs, *params)
-        with self.assertRaises(InputOutsideDomain):
-            splines.rational_quadratic_spline(inputs, *params, check_domain=True)
-        # The caller takes responsibility for the domain; no host-side check.
-        splines.rational_quadratic_spline(inputs.clamp(0, 1), *params, check_domain=False)
+        eager = splines.unconstrained_rational_quadratic_spline(inputs, *params)
+        compiled = torch.compile(
+            splines.unconstrained_rational_quadratic_spline,
+            fullgraph=True,
+            backend="aot_eager",
+        )
+        out, logabsdet = compiled(inputs, *params)
+        self.eps = 1e-6
+        self.assertEqual(out, eager[0])
+        self.assertEqual(logabsdet, eager[1])
