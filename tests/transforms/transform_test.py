@@ -22,7 +22,7 @@ class TransformTest(torchtestcase.TorchTestCase):
         self.assert_tensor_is_good(outputs, shape=inputs.shape)
         self.assert_tensor_is_good(logabsdet, shape=inputs.shape[:1])
         self.assertEqual(outputs, inputs)
-        self.assertEqual(logabsdet, torch.zeros(inputs.shape[:1]))
+        self.assertEqual(logabsdet, inputs.new_zeros(inputs.shape[:1]))
 
     def assertNotEqual(self, first, second, msg=None):
         if (self._eps and (first - second).abs().max().item() < self._eps) or (
