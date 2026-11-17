@@ -252,8 +252,10 @@ class PiecewiseCouplingTransformTest(TransformTest):
         self.eps = 1e-5
         for shape in self.shapes:
             for cls in self.classes:
-                inputs = 3.0 * torch.randn(batch_size, *shape)
+                # Keep random cubic bins from amplifying float32 round-off.
+                inputs = 3.0 * torch.randn(batch_size, *shape, dtype=torch.float64)
                 transform, mask = create_coupling_transform(cls, shape, tails="linear")
+                transform = transform.double()
                 with self.subTest(cls=cls, shape=shape):
                     self.eps = 1e-4  # TODO: can do better?
                     self.assert_forward_inverse_are_consistent(transform, inputs)
