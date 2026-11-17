@@ -51,7 +51,9 @@ class TestPiecewiseCDF(TransformTest):
     def test_ones_to_ones(self):
         for transform in self.transforms:
             with self.subTest(transform=transform):
-                inputs = torch.ones(self.batch_size, *self.shape)
+                # Cubic evaluation can amplify float32 round-off at the endpoint.
+                transform = transform.double()
+                inputs = torch.ones(self.batch_size, *self.shape, dtype=torch.float64)
                 outputs, _ = transform(inputs)
                 self.eps = 1e-5
                 self.assertEqual(outputs, inputs)
